@@ -27,6 +27,22 @@ async function run() {
     const docUrl = process.argv[6];
     const memoUrl = process.argv[7];
 
+    const r2PublicBase = process.env.CLOUDFLARE_PUBLIC_URL || `https://${process.env.CLOUDFLARE_BUCKET}.f3ddf529fe9c02e47f994cc64605eb5a.r2.dev`;
+
+    let formattedDocUrl = docUrl;
+    if (docUrl && !docUrl.startsWith('http')) {
+        const cleanKey = docUrl.startsWith('past-papers/') ? docUrl : `past-papers/${docUrl}`;
+        formattedDocUrl = `${r2PublicBase}/${cleanKey}`;
+    }
+
+    let formattedMemoUrl = memoUrl;
+    if (memoUrl && memoUrl !== 'NO_MEMO' && memoUrl !== 'null' && !memoUrl.startsWith('http')) {
+        const cleanKey = memoUrl.startsWith('past-papers/') ? memoUrl : `past-papers/${memoUrl}`;
+        formattedMemoUrl = `${r2PublicBase}/${cleanKey}`;
+    } else if (memoUrl === 'NO_MEMO' || memoUrl === 'null' || !memoUrl) {
+        formattedMemoUrl = null;
+    }
+
     if (!jsonPath || !subjectName || !year || !paperNumber || !docUrl) {
         console.error('Usage: npx tsx scripts/seed_extracted_questions.ts <jsonPath> <subjectName> <year> <paperNumber> <docUrl> [memoUrl]');
         process.exit(1);
@@ -80,8 +96,8 @@ async function run() {
                 subject_id: subjectId,
                 year: year,
                 paper_number: paperNumber,
-                document_url: docUrl,
-                memo_url: memoUrl || null
+                document_url: formattedDocUrl,
+                memo_url: formattedMemoUrl
             })
             .select('id')
             .single();

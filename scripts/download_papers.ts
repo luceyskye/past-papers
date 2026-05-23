@@ -112,21 +112,28 @@ async function run() {
             fs.writeFileSync(localFilePath, buffer);
             console.log(`✓ Saved locally: ${localFilePath}`);
 
-            // 2. Upload to Supabase
-            const { data, error } = await supabase.storage
-                .from('past-papers')
-                .upload(supabasePath, buffer, {
-                    contentType: 'application/pdf',
-                    upsert: true
+            // 2. Upload to Cloudflare R2
+            const r2Key = `past-papers/${supabasePath}`;
+            const r2Url = `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${process.env.CLOUDFLARE_BUCKET}/objects/${encodeURIComponent(r2Key)}`;
+            
+            try {
+                await axios.put(r2Url, buffer, {
+                    headers: {
+                        'Authorization': `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+                        'Content-Type': 'application/pdf'
+                    },
+                    maxContentLength: Infinity,
+                    maxBodyLength: Infinity
                 });
-
-            if (error) {
-                console.error(`✗ Supabase upload failed:`, error.message);
-            } else {
-                console.log(`✓ Uploaded to Supabase: ${supabasePath}`);
+                console.log(`✓ Uploaded to Cloudflare R2: ${r2Key}`);
+            } catch (r2Err: any) {
+                console.error(`✗ Cloudflare R2 upload failed:`, r2Err.response?.data || r2Err.message);
             }
 
-            catalogEntries += `- [ ] **${paper.subject}**: ${paper.title}\n  - Local: \`${localFilePath}\`\n  - Storage: \`past-papers/${supabasePath}\`\n\n`;
+            const r2PublicBase = process.env.CLOUDFLARE_PUBLIC_URL || `https://${process.env.CLOUDFLARE_BUCKET}.f3ddf529fe9c02e47f994cc64605eb5a.r2.dev`;
+            const finalStoragePath = `${r2PublicBase}/${r2Key}`;
+
+            catalogEntries += `- [ ] **${paper.subject}**: ${paper.title}\n  - Local: \`${localFilePath}\`\n  - Storage: \`${finalStoragePath}\`\n\n`;
 
         } catch (e: any) {
             console.error(`✗ Failed to download ${fileName}:`, e.message);
