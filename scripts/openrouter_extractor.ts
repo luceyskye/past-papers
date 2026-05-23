@@ -74,6 +74,7 @@ Ensure the JSON is perfectly valid:
 - Do NOT use trailing commas (e.g. [1, 2,] is invalid).
 - Escape all newlines in string properties as \\n.
 - Escape all double quotes inside string values as \\\".
+- Keep "text" and "answer" properties concise. Summarize long descriptions and options to prevent output token truncation.
 `;
 
     try {
