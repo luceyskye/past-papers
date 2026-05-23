@@ -81,6 +81,7 @@ Ensure the JSON is perfectly valid:
         let response = await openrouter.chat.completions.create({
             model: model,
             messages: [{ role: 'user', content: prompt }],
+            max_tokens: 8192
         });
 
         let resultText = response.choices[0].message.content || '[]';
@@ -92,6 +93,7 @@ Ensure the JSON is perfectly valid:
             let response = await openrouter.chat.completions.create({
                 model: model,
                 messages: [{ role: 'user', content: prompt }],
+                max_tokens: 8192
             });
             return response.choices[0].message.content || '[]';
         }
@@ -131,8 +133,9 @@ async function processBatch() {
                 continue;
             }
 
+            let jsonStr = '';
             try {
-                let jsonStr = await extractWithOpenRouter(paperText, memoText, paper.paper_name);
+                jsonStr = await extractWithOpenRouter(paperText, memoText, paper.paper_name);
                 jsonStr = cleanJsonString(jsonStr);
 
                 // Verify it parses
@@ -151,6 +154,12 @@ async function processBatch() {
 
             } catch (e: any) {
                 console.error(`Error processing ${paper.paper_name}:`, e.message);
+                if (jsonStr) {
+                    const debugPath = path.resolve(process.cwd(), `../../.reference/extracted_json/failed_parse_debug.txt`);
+                    fs.mkdirSync(path.dirname(debugPath), { recursive: true });
+                    fs.writeFileSync(debugPath, jsonStr);
+                    console.log(`Saved failed JSON string for debugging to ${debugPath}`);
+                }
             }
         }
     }
