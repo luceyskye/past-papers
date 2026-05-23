@@ -70,6 +70,10 @@ ${memoText.substring(0, 50000)}
 ---
 
 IMPORTANT: Reply ONLY with valid JSON array. No markdown blocks, no other text.
+Ensure the JSON is perfectly valid:
+- Do NOT use trailing commas (e.g. [1, 2,] is invalid).
+- Escape all newlines in string properties as \\n.
+- Escape all double quotes inside string values as \\\".
 `;
 
     try {
@@ -97,6 +101,8 @@ IMPORTANT: Reply ONLY with valid JSON array. No markdown blocks, no other text.
 
 function cleanJsonString(str: string) {
     str = str.replace(/^```json/gi, '').replace(/^```/gi, '').replace(/```$/g, '').trim();
+    // Remove trailing commas in arrays and objects
+    str = str.replace(/,\s*([\]}])/g, '$1');
     return str;
 }
 
