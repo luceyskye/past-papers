@@ -21,3 +21,8 @@ Key HTML elements to target:
    - Paper Number (P1, P2, P3)
    - Type (Exam Paper vs. Memo)
 4. **Ingest**: Output the structured data so it can be inserted into the Supabase `past_papers` table, mapping to the appropriate `subject_id` and `year`.
+
+## Repository Details
+
+This actor is maintained in its own dedicated repository at [github.com/luceyskye/past-papers](https://github.com/luceyskye/past-papers).
+

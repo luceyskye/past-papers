@@ -22,11 +22,11 @@ const openrouter = new OpenAI({
 const JSON_SCHEMA = `
 [
   {
-    "question_number": 1,
+    "question_number": "1.1", // String. MUST be wrapped in double quotes. Do NOT output as a number!
     "text": "The full text of the question",
-    "type": "multiple_choice | open_ended | true_false | short_answer",
-    "options": ["A", "B", "C"], // or null if not applicable
-    "answer": "The answer or memo response", // or null if NO_MEMO
+    "type": "multiple_choice | open_ended", // Use only these two exact values
+    "options": ["A", "B", "C"], // array of options (strings) or null if not multiple choice
+    "answer": "The answer or memo key", // string, or null if NO_MEMO
     "marks": 5 // integer
   }
 ]
@@ -45,28 +45,183 @@ async function parsePdf(filePath: string): Promise<string> {
     }
 }
 
+function normalizeText(text: string): string {
+    return text.replace(/\s+/g, ' ').trim();
+}
+
+function getOrigIndex(orig: string, norm: string, normIdx: number): number {
+    let normCount = 0;
+    let origIdx = 0;
+    while (origIdx < orig.length && normCount < normIdx) {
+        if (/\s/.test(orig[origIdx])) {
+            origIdx++;
+        } else {
+            normCount++;
+            origIdx++;
+        }
+    }
+    return origIdx;
+}
+
+async function getSplitsFromAI(paperText: string, memoText: string, paperName: string): Promise<any[]> {
+    const paperSample = paperText.substring(0, 35000);
+    const memoSample = memoText.substring(0, 35000);
+    
+    const prompt = `
+You are an expert exam parser.
+Your task is to identify the main sections or question blocks (e.g., "Section A", "Section B", "Section C", or "Question 1", "Question 2", "Question 3") in the provided exam paper.
+For each section, find a unique 15-20 character text snippet from the raw paper text and the raw memo text that marks the exact start of that section.
+The snippets MUST appear EXACTLY in the texts (including case, spaces, and punctuation).
+
+RAW PAPER TEXT (First 35k chars):
+---
+${paperSample}
+---
+
+RAW MEMO TEXT (First 35k chars):
+---
+${memoSample}
+---
+
+Output a valid JSON array of objects with the following schema:
+[
+  {
+    "section_name": "Section A",
+    "paper_start_snippet": "exact snippet marking the start of Section A in the paper",
+    "memo_start_snippet": "exact snippet marking the start of Section A in the memo"
+  }
+]
+Reply ONLY with the valid JSON array. No markdown blocks, no other text.
+`;
+
+    let model = 'deepseek/deepseek-v4-flash:free';
+    try {
+        console.log(`Asking OpenRouter (${model}) to identify sections for ${paperName}...`);
+        let response = await openrouter.chat.completions.create({
+            model: model,
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 1000
+        });
+        const text = response.choices[0].message.content || '[]';
+        return JSON.parse(cleanJsonString(text));
+    } catch (err: any) {
+        if (err.status === 429 || err.status === 402 || (err.message && (err.message.includes('429') || err.message.includes('402')))) {
+            console.log(`Rate limit or quota hit on free model for section splitting. Falling back to deepseek/deepseek-v4-flash...`);
+            model = 'deepseek/deepseek-v4-flash';
+            let response = await openrouter.chat.completions.create({
+                model: model,
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: 1000
+            });
+            const text = response.choices[0].message.content || '[]';
+            return JSON.parse(cleanJsonString(text));
+        }
+        throw err;
+    }
+}
+
+async function splitExam(paperText: string, memoText: string, paperName: string): Promise<{ name: string, paperChunk: string, memoChunk: string }[]> {
+    if (paperText.length <= 40000 && memoText.length <= 40000) {
+        console.log(`Paper is small enough. Processing in a single chunk.`);
+        return [{ name: 'Whole Paper', paperChunk: paperText, memoChunk: memoText }];
+    }
+
+    let splits: any[] = [];
+    try {
+        splits = await getSplitsFromAI(paperText, memoText, paperName);
+    } catch (err) {
+        console.log(`Failed to get splits from AI, fallback to processing whole paper:`, err);
+    }
+
+    if (!splits || !Array.isArray(splits) || splits.length <= 1) {
+        console.log(`No valid section splits found. Processing as whole paper.`);
+        return [{ name: 'Whole Paper', paperChunk: paperText, memoChunk: memoText }];
+    }
+
+    const normPaper = normalizeText(paperText);
+    const normMemo = normalizeText(memoText);
+    const normPaperLower = normPaper.toLowerCase();
+    const normMemoLower = normMemo.toLowerCase();
+
+    const paperIndices = splits.map(s => {
+        const normSnippet = normalizeText(s.paper_start_snippet || '');
+        if (!normSnippet) return null;
+        const index = normPaperLower.indexOf(normSnippet.toLowerCase());
+        return { name: s.section_name, index, snippet: normSnippet };
+    }).filter((x): x is { name: string, index: number, snippet: string } => x !== null && x.index !== -1)
+      .sort((a, b) => a.index - b.index);
+
+    const memoIndices = splits.map(s => {
+        const normSnippet = normalizeText(s.memo_start_snippet || '');
+        if (!normSnippet) return null;
+        const index = normMemoLower.indexOf(normSnippet.toLowerCase());
+        return { name: s.section_name, index, snippet: normSnippet };
+    }).filter((x): x is { name: string, index: number, snippet: string } => x !== null && x.index !== -1)
+      .sort((a, b) => a.index - b.index);
+
+    if (paperIndices.length <= 1 || memoIndices.length <= 1) {
+        console.log(`Could not find matching snippets in text (paper matches: ${paperIndices.length}, memo matches: ${memoIndices.length}). Falling back to whole paper.`);
+        return [{ name: 'Whole Paper', paperChunk: paperText, memoChunk: memoText }];
+    }
+
+    console.log(`Splitting paper into ${paperIndices.length} sections based on AI analysis.`);
+    const chunks: { name: string, paperChunk: string, memoChunk: string }[] = [];
+
+    const paperOrigIndices = paperIndices.map(x => ({
+        name: x.name,
+        index: getOrigIndex(paperText, normPaper, x.index)
+    })).sort((a, b) => a.index - b.index);
+
+    const memoOrigIndices = memoIndices.map(x => ({
+        name: x.name,
+        index: getOrigIndex(memoText, normMemo, x.index)
+    })).sort((a, b) => a.index - b.index);
+
+    for (let i = 0; i < paperOrigIndices.length; i++) {
+        const pStart = paperOrigIndices[i].index;
+        const pEnd = i < paperOrigIndices.length - 1 ? paperOrigIndices[i+1].index : paperText.length;
+        
+        const mSec = memoOrigIndices.find(x => x.name === paperOrigIndices[i].name) || memoOrigIndices[i];
+        const mSecIdx = memoOrigIndices.indexOf(mSec);
+        const mStart = mSec.index;
+        const mEnd = mSecIdx < memoOrigIndices.length - 1 ? memoOrigIndices[mSecIdx + 1].index : memoText.length;
+
+        chunks.push({
+            name: paperOrigIndices[i].name,
+            paperChunk: paperText.substring(pStart, pEnd),
+            memoChunk: memoText.substring(mStart, mEnd)
+        });
+    }
+
+    return chunks;
+}
+
 async function extractWithOpenRouter(paperText: string, memoText: string, paperName: string) {
     let model = 'deepseek/deepseek-v4-flash:free';
     const prompt = `
 You are an expert exam parser.
-I have extracted raw text from a South African DBE past paper and its official memo.
+I have extracted raw text from a section of a South African DBE past paper and its official memo.
 Your job is to align the questions from the paper with the answers from the memo, and output a valid JSON array of objects.
 
 Schema requirement:
 ${JSON_SCHEMA}
 
-Extract EVERY question you can find. DO NOT group questions. For multiple choice, include the full text of the options in the "options" array.
-For answers, copy the memo's answer directly.
-If there is NO_MEMO provided, set answer to null.
+Instructions:
+1. Extract EVERY question you can find in the provided text.
+2. DO NOT group questions together.
+3. For multiple choice questions, include the full text of the options in the "options" array.
+4. For answers, copy the memo's answer/marking guidelines directly. If NO_MEMO is provided, set answer to null.
+5. "question_number" MUST be a string wrapped in double quotes (e.g., "1.1", "4.1.1"). NEVER output a number without quotes.
+6. "type" MUST be exactly "multiple_choice" or "open_ended".
 
-RAW PAPER TEXT:
+RAW PAPER TEXT SECTION:
 ---
-${paperText.substring(0, 50000)}
+${paperText}
 ---
 
-RAW MEMO TEXT:
+RAW MEMO TEXT SECTION:
 ---
-${memoText.substring(0, 50000)}
+${memoText}
 ---
 
 IMPORTANT: Reply ONLY with valid JSON array. No markdown blocks, no other text.
@@ -102,9 +257,56 @@ Ensure the JSON is perfectly valid:
     }
 }
 
+function repairTruncatedJsonArray(str: string): string {
+    str = str.trim();
+    if (str.endsWith(']')) return str;
+
+    let openBraces = 0;
+    let openBrackets = 0;
+    let lastValidEnd = -1;
+    let inString = false;
+    let escape = false;
+
+    for (let i = 0; i < str.length; i++) {
+        const char = str[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (char === '\\') {
+            escape = true;
+            continue;
+        }
+        if (char === '"') {
+            inString = !inString;
+            continue;
+        }
+        if (!inString) {
+            if (char === '{') {
+                openBraces++;
+            } else if (char === '}') {
+                openBraces--;
+                if (openBraces === 0 && openBrackets === 1) {
+                    lastValidEnd = i;
+                }
+            } else if (char === '[') {
+                openBrackets++;
+            } else if (char === ']') {
+                openBrackets--;
+            }
+        }
+    }
+
+    if (lastValidEnd !== -1) {
+        return str.substring(0, lastValidEnd + 1) + '\n]';
+    }
+
+    return str;
+}
+
 function cleanJsonString(str: string) {
     str = str.replace(/^```json/gi, '').replace(/^```/gi, '').replace(/```$/g, '').trim();
-    // Remove trailing commas in arrays and objects
+    str = repairTruncatedJsonArray(str);
     str = str.replace(/,\s*([\]}])/g, '$1');
     return str;
 }
@@ -134,33 +336,50 @@ async function processBatch() {
                 continue;
             }
 
-            let jsonStr = '';
-            try {
-                jsonStr = await extractWithOpenRouter(paperText, memoText, paper.paper_name);
-                jsonStr = cleanJsonString(jsonStr);
+            console.log(`Paper length: ${paperText.length} chars, Memo length: ${memoText.length} chars.`);
 
-                // Verify it parses
-                const parsed = JSON.parse(jsonStr);
+            const chunks = await splitExam(paperText, memoText, paper.paper_name);
+            console.log(`Processing ${chunks.length} section chunks...`);
 
-                // Define output path
+            const allQuestions: any[] = [];
+            let chunkIndex = 1;
+            for (const chunk of chunks) {
+                console.log(`--- Processing Chunk ${chunkIndex}/${chunks.length}: ${chunk.name} ---`);
+                let jsonStr = '';
+                try {
+                    jsonStr = await extractWithOpenRouter(chunk.paperChunk, chunk.memoChunk, `${paper.paper_name} (${chunk.name})`);
+                    jsonStr = cleanJsonString(jsonStr);
+
+                    const parsed = JSON.parse(jsonStr);
+                    if (Array.isArray(parsed)) {
+                        allQuestions.push(...parsed);
+                        console.log(`Extracted ${parsed.length} questions from chunk ${chunk.name}.`);
+                    } else {
+                        console.error(`Parsed JSON from chunk ${chunk.name} is not an array.`);
+                    }
+                } catch (e: any) {
+                    console.error(`Error processing chunk ${chunk.name}:`, e.message);
+                    if (jsonStr) {
+                        const debugPath = path.resolve(process.cwd(), `../../.reference/extracted_json/failed_parse_debug.txt`);
+                        fs.mkdirSync(path.dirname(debugPath), { recursive: true });
+                        fs.writeFileSync(debugPath, jsonStr);
+                        console.log(`Saved failed JSON string for debugging to ${debugPath}`);
+                    }
+                }
+                chunkIndex++;
+            }
+
+            if (allQuestions.length > 0) {
                 const baseName = path.basename(paper.paper_path, '.pdf');
                 const outPath = path.resolve(process.cwd(), `../../.reference/extracted_json/${baseName}.json`);
                 
                 fs.mkdirSync(path.dirname(outPath), { recursive: true });
-                fs.writeFileSync(outPath, JSON.stringify(parsed, null, 2));
+                fs.writeFileSync(outPath, JSON.stringify(allQuestions, null, 2));
 
-                // Mark and seed
-                console.log(`Extracted successfully! Seeding to database...`);
+                console.log(`Extracted successfully! Total questions: ${allQuestions.length}. Seeding to database...`);
                 execSync(`npx tsx scripts/orchestrator_utils.ts mark_and_seed "${outPath}" "${paper.subject}" "${paper.year}" "${paper.paper_name}"`, { stdio: 'inherit' });
-
-            } catch (e: any) {
-                console.error(`Error processing ${paper.paper_name}:`, e.message);
-                if (jsonStr) {
-                    const debugPath = path.resolve(process.cwd(), `../../.reference/extracted_json/failed_parse_debug.txt`);
-                    fs.mkdirSync(path.dirname(debugPath), { recursive: true });
-                    fs.writeFileSync(debugPath, jsonStr);
-                    console.log(`Saved failed JSON string for debugging to ${debugPath}`);
-                }
+            } else {
+                console.error(`Failed to extract any questions for ${paper.paper_name}.`);
             }
         }
     }

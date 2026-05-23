@@ -36,23 +36,47 @@ function getNextBatch() {
                 
                 // Now find the corresponding memo
                 let memoPath = '';
-                for (let j = i + 1; j < lines.length; j++) {
-                    // Stop if we hit the next year's scrape section
-                    if (lines[j].match(/## Scrape: (\d{4})/)) break;
+                const cleanNameForMatching = (name: string) => {
+                    return name
+                        .toLowerCase()
+                        .replace(/memo/g, '')
+                        .replace(/paper/g, '')
+                        .replace(/p(\d+)/g, '$1')
+                        .replace(/_/g, ' ')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                };
 
-                    if (lines[j].includes('- [ ]') && lines[j].toLowerCase().includes('memo') && lines[j].includes(`**${currentSubject}**:`)) {
-                        const candidateMatch = lines[j].match(/^- \[ \] \*\*([^*]+)\*\*: (.*)/);
+                // Find boundaries of the current year section
+                let sectionStart = 0;
+                for (let k = i; k >= 0; k--) {
+                    if (lines[k].match(/## Scrape:/)) {
+                        sectionStart = k;
+                        break;
+                    }
+                }
+                let sectionEnd = lines.length;
+                for (let k = i + 1; k < lines.length; k++) {
+                    if (lines[k].match(/## Scrape:/)) {
+                        sectionEnd = k;
+                        break;
+                    }
+                }
+
+                // Search for the memo within this year's section
+                for (let j = sectionStart; j < sectionEnd; j++) {
+                    const lineJ = lines[j];
+                    if (lineJ.toLowerCase().includes('memo') && lineJ.includes(`**${currentSubject}**:`)) {
+                        const candidateMatch = lineJ.match(/^-\s*\[[ x]\]\s*\*\*([^*]+)\*\*:\s*(.*)/i);
                         if (candidateMatch) {
-                            let candidateName = candidateMatch[2];
-                            // Remove 'memo' and normalize spaces
-                            let candidateCleaned = candidateName.replace(/memo/i, '').replace(/\s+/g, ' ').trim();
-                            let paperCleaned = paperName.replace(/\s+/g, ' ').trim();
-                            
-                            if (candidateCleaned.toLowerCase() === paperCleaned.toLowerCase()) {
+                            const candidateName = candidateMatch[2];
+                            if (cleanNameForMatching(candidateName) === cleanNameForMatching(paperName)) {
                                 const memoPathLine = lines[j+1] || '';
                                 const memoMatch = memoPathLine.match(/Local: `([^`]+)`/);
-                                if (memoMatch) memoPath = memoMatch[1];
-                                break;
+                                if (memoMatch) {
+                                    memoPath = memoMatch[1];
+                                    break;
+                                }
                             }
                         }
                     }
@@ -77,52 +101,102 @@ function getNextBatch() {
 }
 
 function markAndSeed(jsonPath: string, subject: string, year: string, paper_name: string) {
-    // Determine paper number from name
-    const match = paper_name.match(/P(\d+)/);
-    const paperNumber = match ? match[1] : '1';
+    let paperNumber = '1';
+    const matchPaper = paper_name.match(/Paper\s*(\d+)/i);
+    const matchP = paper_name.match(/P(\d+)/i);
+    if (matchPaper) {
+        paperNumber = matchPaper[1];
+    } else if (matchP) {
+        paperNumber = matchP[1];
+    }
 
-    // Seed database
-    console.log(`Seeding ${subject} ${year} Paper ${paperNumber}...`);
     try {
-        // Find URLs in markdown
         const content = fs.readFileSync(ANALYSIS_FILE, 'utf8');
-        let docUrl = '';
-        let memoUrl = '';
-        const lines = content.split('\n');
-        for (let i = 0; i < lines.length; i++) {
-            if (lines[i].includes(`**${subject}**: ${paper_name}`)) {
-                const storageLine = lines[i+2] || '';
-                const sMatch = storageLine.match(/Storage: `([^`]+)`/);
-                if (sMatch) docUrl = sMatch[1];
-            }
-            if (lines[i].includes(`**${subject}**: ${paper_name} memo`)) {
-                const storageLine = lines[i+2] || '';
-                const sMatch = storageLine.match(/Storage: `([^`]+)`/);
-                if (sMatch) memoUrl = sMatch[1];
-            }
-        }
-
-        execSync(`npx tsx scripts/seed_extracted_questions.ts "${jsonPath}" "${subject}" ${year} ${paperNumber} "${docUrl}" "${memoUrl}"`, { stdio: 'inherit' });
-
-        // Mark as done
         const outputLines = content.split('\n');
-        for (let i = 0; i < outputLines.length; i++) {
+
+        let paperLineIndex = -1;
+        for (let idx = 0; idx < outputLines.length; idx++) {
             const paperTarget = `- [ ] **${subject}**: ${paper_name}`;
-            const memoTarget = `- [ ] **${subject}**: ${paper_name} memo`;
-            const memoTargetCaps = `- [ ] **${subject}**: ${paper_name} Memo`;
-            
-            if (outputLines[i].startsWith(paperTarget)) {
-                outputLines[i] = outputLines[i].replace(paperTarget, `- [x] **${subject}**: ${paper_name}`);
-            }
-            if (outputLines[i].startsWith(memoTarget)) {
-                outputLines[i] = outputLines[i].replace(memoTarget, `- [x] **${subject}**: ${paper_name} memo`);
-            }
-            if (outputLines[i].startsWith(memoTargetCaps)) {
-                outputLines[i] = outputLines[i].replace(memoTargetCaps, `- [x] **${subject}**: ${paper_name} Memo`);
+            const paperTargetDone = `- [x] **${subject}**: ${paper_name}`;
+            if (outputLines[idx].startsWith(paperTarget) || outputLines[idx].startsWith(paperTargetDone)) {
+                paperLineIndex = idx;
+                break;
             }
         }
-        fs.writeFileSync(ANALYSIS_FILE, outputLines.join('\n'));
+
+        if (paperLineIndex === -1) {
+            console.error(`✗ Could not find paper line in analysis file for: ${subject} - ${paper_name}`);
+            return;
+        }
+
+        // 1. Find paper URL
+        let docUrl = '';
+        const storageLine = outputLines[paperLineIndex+2] || '';
+        const sMatch = storageLine.match(/Storage: `([^`]+)`/);
+        if (sMatch) docUrl = sMatch[1];
+
+        // Find boundaries of the current year section
+        let sectionStart = 0;
+        for (let k = paperLineIndex; k >= 0; k--) {
+            if (outputLines[k].match(/## Scrape:/)) {
+                sectionStart = k;
+                break;
+            }
+        }
+        let sectionEnd = outputLines.length;
+        for (let k = paperLineIndex + 1; k < outputLines.length; k++) {
+            if (outputLines[k].match(/## Scrape:/)) {
+                sectionEnd = k;
+                break;
+            }
+        }
+
+        const cleanNameForMatching = (name: string) => {
+            return name
+                .toLowerCase()
+                .replace(/memo/g, '')
+                .replace(/paper/g, '')
+                .replace(/p(\d+)/g, '$1')
+                .replace(/_/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        };
+
+        // 2. Find matching memo, its URL, and mark it
+        let memoUrl = '';
+        let memoLineIndex = -1;
+        for (let j = sectionStart; j < sectionEnd; j++) {
+            const lineJ = outputLines[j];
+            if (lineJ.toLowerCase().includes('memo') && lineJ.includes(`**${subject}**:`)) {
+                const candidateMatch = lineJ.match(/^-\s*\[[ x]\]\s*\*\*([^*]+)\*\*:\s*(.*)/i);
+                if (candidateMatch) {
+                    const candidateName = candidateMatch[2];
+                    if (cleanNameForMatching(candidateName) === cleanNameForMatching(paper_name)) {
+                        memoLineIndex = j;
+                        const storageLineMemo = outputLines[j+2] || '';
+                        const sMatchMemo = storageLineMemo.match(/Storage: `([^`]+)`/);
+                        if (sMatchMemo) memoUrl = sMatchMemo[1];
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Seed database
+        console.log(`Seeding ${subject} ${year} Paper ${paperNumber}...`);
+        console.log(`Paper URL: ${docUrl}`);
+        console.log(`Memo URL: ${memoUrl || 'None'}`);
         
+        execSync(`npx tsx scripts/seed_extracted_questions.ts "${jsonPath}" "${subject}" ${year} ${paperNumber} "${docUrl}" "${memoUrl || 'NO_MEMO'}"`, { stdio: 'inherit' });
+
+        // 3. Mark as done in markdown
+        outputLines[paperLineIndex] = outputLines[paperLineIndex].replace(/^-\s*\[[ x]\]/i, '- [x]');
+        if (memoLineIndex !== -1) {
+            outputLines[memoLineIndex] = outputLines[memoLineIndex].replace(/^-\s*\[[ x]\]/i, '- [x]');
+            console.log(`✓ Marked matching memo line as done.`);
+        }
+
+        fs.writeFileSync(ANALYSIS_FILE, outputLines.join('\n'));
         console.log(`✓ Marked ${paper_name} as done.`);
     } catch (e: any) {
         console.error(`✗ Failed to seed or mark ${paper_name}:`, e.message);
