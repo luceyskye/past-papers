@@ -181,10 +181,18 @@ async function splitExam(paperText: string, memoText: string, paperName: string)
         const pStart = paperOrigIndices[i].index;
         const pEnd = i < paperOrigIndices.length - 1 ? paperOrigIndices[i+1].index : paperText.length;
         
-        const mSec = memoOrigIndices.find(x => x.name === paperOrigIndices[i].name) || memoOrigIndices[i];
-        const mSecIdx = memoOrigIndices.indexOf(mSec);
-        const mStart = mSec.index;
-        const mEnd = mSecIdx < memoOrigIndices.length - 1 ? memoOrigIndices[mSecIdx + 1].index : memoText.length;
+        const mSec = memoOrigIndices.find(x => x.name === paperOrigIndices[i].name) || memoOrigIndices[Math.min(i, memoOrigIndices.length - 1)];
+        
+        let mStart = 0;
+        let mEnd = memoText.length;
+        if (mSec) {
+            const mSecIdx = memoOrigIndices.indexOf(mSec);
+            mStart = mSec.index;
+            mEnd = mSecIdx < memoOrigIndices.length - 1 ? memoOrigIndices[mSecIdx + 1].index : memoText.length;
+        } else if (memoOrigIndices.length > 0) {
+            mStart = memoOrigIndices[Math.min(i, memoOrigIndices.length - 1)].index;
+            mEnd = i < paperOrigIndices.length - 1 ? (memoOrigIndices[Math.min(i + 1, memoOrigIndices.length - 1)]?.index || memoText.length) : memoText.length;
+        }
 
         chunks.push({
             name: paperOrigIndices[i].name,
