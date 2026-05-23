@@ -122,7 +122,7 @@ Reply ONLY with the valid JSON array. No markdown blocks, no other text.
 
 async function splitExam(paperText: string, memoText: string, paperName: string): Promise<{ name: string, paperChunk: string, memoChunk: string }[]> {
     if (paperText.length <= 40000 && memoText.length <= 40000) {
-        console.log(`Paper is small enough. Processing in a single chunk.`);
+        console.log(`[Split] ${paperName}: Paper is small enough. Processing in a single chunk.`);
         return [{ name: 'Whole Paper', paperChunk: paperText, memoChunk: memoText }];
     }
 
@@ -130,11 +130,11 @@ async function splitExam(paperText: string, memoText: string, paperName: string)
     try {
         splits = await getSplitsFromAI(paperText, memoText, paperName);
     } catch (err) {
-        console.log(`Failed to get splits from AI, fallback to processing whole paper:`, err);
+        console.log(`[Split] ${paperName}: Failed to get splits from AI, fallback to processing whole paper:`, err);
     }
 
     if (!splits || !Array.isArray(splits) || splits.length <= 1) {
-        console.log(`No valid section splits found. Processing as whole paper.`);
+        console.log(`[Split] ${paperName}: No valid section splits found. Processing as whole paper.`);
         return [{ name: 'Whole Paper', paperChunk: paperText, memoChunk: memoText }];
     }
 
@@ -160,11 +160,11 @@ async function splitExam(paperText: string, memoText: string, paperName: string)
       .sort((a, b) => a.index - b.index);
 
     if (paperIndices.length <= 1 || memoIndices.length <= 1) {
-        console.log(`Could not find matching snippets in text (paper matches: ${paperIndices.length}, memo matches: ${memoIndices.length}). Falling back to whole paper.`);
+        console.log(`[Split] ${paperName}: Could not find matching snippets in text (paper matches: ${paperIndices.length}, memo matches: ${memoIndices.length}). Falling back to whole paper.`);
         return [{ name: 'Whole Paper', paperChunk: paperText, memoChunk: memoText }];
     }
 
-    console.log(`Splitting paper into ${paperIndices.length} sections based on AI analysis.`);
+    console.log(`[Split] ${paperName}: Splitting paper into ${paperIndices.length} sections based on AI analysis.`);
     const chunks: { name: string, paperChunk: string, memoChunk: string }[] = [];
 
     const paperOrigIndices = paperIndices.map(x => ({
@@ -311,7 +311,65 @@ function cleanJsonString(str: string) {
     return str;
 }
 
+async function processPaper(paper: any) {
+    console.log(`[Start] ${paper.subject} ${paper.year} ${paper.paper_name}`);
+    
+    const paperText = await parsePdf(paper.paper_path);
+    const memoText = await parsePdf(paper.memo_path);
+
+    if (!paperText) {
+        console.error(`[Error] Skipping ${paper.paper_name} due to empty paper text.`);
+        return;
+    }
+
+    console.log(`[Parsed] ${paper.paper_name}: Paper length: ${paperText.length} chars, Memo length: ${memoText.length} chars.`);
+
+    const chunks = await splitExam(paperText, memoText, paper.paper_name);
+    console.log(`[Split] ${paper.paper_name}: Processing ${chunks.length} section chunks...`);
+
+    const allQuestions: any[] = [];
+    let chunkIndex = 1;
+    for (const chunk of chunks) {
+        console.log(`[Chunk ${chunkIndex}/${chunks.length}] ${paper.paper_name} (${chunk.name})`);
+        let jsonStr = '';
+        try {
+            jsonStr = await extractWithOpenRouter(chunk.paperChunk, chunk.memoChunk, `${paper.paper_name} (${chunk.name})`);
+            jsonStr = cleanJsonString(jsonStr);
+
+            const parsed = JSON.parse(jsonStr);
+            if (Array.isArray(parsed)) {
+                allQuestions.push(...parsed);
+                console.log(`[Chunk Success] ${paper.paper_name} (${chunk.name}): Extracted ${parsed.length} questions.`);
+            } else {
+                console.error(`[Error] Parsed JSON from chunk ${chunk.name} is not an array.`);
+            }
+        } catch (e: any) {
+            console.error(`[Error] Processing chunk ${chunk.name} in ${paper.paper_name}:`, e.message);
+            if (jsonStr) {
+                const debugPath = path.resolve(process.cwd(), `../../.reference/extracted_json/failed_parse_debug.txt`);
+                fs.mkdirSync(path.dirname(debugPath), { recursive: true });
+                fs.writeFileSync(debugPath, jsonStr);
+            }
+        }
+        chunkIndex++;
+    }
+
+    if (allQuestions.length > 0) {
+        const baseName = path.basename(paper.paper_path, '.pdf');
+        const outPath = path.resolve(process.cwd(), `../../.reference/extracted_json/${baseName}.json`);
+        
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.writeFileSync(outPath, JSON.stringify(allQuestions, null, 2));
+
+        console.log(`[Success] ${paper.paper_name}: Extracted successfully! Total questions: ${allQuestions.length}. Seeding to database...`);
+        execSync(`npx tsx scripts/orchestrator_utils.ts mark_and_seed "${outPath}" "${paper.subject}" "${paper.year}" "${paper.paper_name}"`, { stdio: 'inherit' });
+    } else {
+        console.error(`[Fail] ${paper.paper_name}: Failed to extract any questions.`);
+    }
+}
+
 async function processBatch() {
+    const CONCURRENCY = 3;
     while (true) {
         const batchOutput = execSync('npx tsx scripts/orchestrator_utils.ts next_batch').toString();
         if (!batchOutput.trim()) {
@@ -325,63 +383,22 @@ async function processBatch() {
             break;
         }
 
-        for (const paper of batch) {
-            console.log(`\n=== Processing ${paper.subject} ${paper.year} ${paper.paper_name} ===`);
-            
-            const paperText = await parsePdf(paper.paper_path);
-            const memoText = await parsePdf(paper.memo_path);
+        console.log(`\n=== Processing batch of ${batch.length} papers with concurrency ${CONCURRENCY} ===`);
 
-            if (!paperText) {
-                console.error(`Skipping ${paper.paper_name} due to empty paper text.`);
-                continue;
-            }
-
-            console.log(`Paper length: ${paperText.length} chars, Memo length: ${memoText.length} chars.`);
-
-            const chunks = await splitExam(paperText, memoText, paper.paper_name);
-            console.log(`Processing ${chunks.length} section chunks...`);
-
-            const allQuestions: any[] = [];
-            let chunkIndex = 1;
-            for (const chunk of chunks) {
-                console.log(`--- Processing Chunk ${chunkIndex}/${chunks.length}: ${chunk.name} ---`);
-                let jsonStr = '';
+        let index = 0;
+        const workers = Array.from({ length: CONCURRENCY }, async () => {
+            while (index < batch.length) {
+                const paper = batch[index++];
+                if (!paper) break;
                 try {
-                    jsonStr = await extractWithOpenRouter(chunk.paperChunk, chunk.memoChunk, `${paper.paper_name} (${chunk.name})`);
-                    jsonStr = cleanJsonString(jsonStr);
-
-                    const parsed = JSON.parse(jsonStr);
-                    if (Array.isArray(parsed)) {
-                        allQuestions.push(...parsed);
-                        console.log(`Extracted ${parsed.length} questions from chunk ${chunk.name}.`);
-                    } else {
-                        console.error(`Parsed JSON from chunk ${chunk.name} is not an array.`);
-                    }
-                } catch (e: any) {
-                    console.error(`Error processing chunk ${chunk.name}:`, e.message);
-                    if (jsonStr) {
-                        const debugPath = path.resolve(process.cwd(), `../../.reference/extracted_json/failed_parse_debug.txt`);
-                        fs.mkdirSync(path.dirname(debugPath), { recursive: true });
-                        fs.writeFileSync(debugPath, jsonStr);
-                        console.log(`Saved failed JSON string for debugging to ${debugPath}`);
-                    }
+                    await processPaper(paper);
+                } catch (err: any) {
+                    console.error(`Fatal error in parallel worker processing ${paper.paper_name}:`, err.message);
                 }
-                chunkIndex++;
             }
+        });
 
-            if (allQuestions.length > 0) {
-                const baseName = path.basename(paper.paper_path, '.pdf');
-                const outPath = path.resolve(process.cwd(), `../../.reference/extracted_json/${baseName}.json`);
-                
-                fs.mkdirSync(path.dirname(outPath), { recursive: true });
-                fs.writeFileSync(outPath, JSON.stringify(allQuestions, null, 2));
-
-                console.log(`Extracted successfully! Total questions: ${allQuestions.length}. Seeding to database...`);
-                execSync(`npx tsx scripts/orchestrator_utils.ts mark_and_seed "${outPath}" "${paper.subject}" "${paper.year}" "${paper.paper_name}"`, { stdio: 'inherit' });
-            } else {
-                console.error(`Failed to extract any questions for ${paper.paper_name}.`);
-            }
-        }
+        await Promise.all(workers);
     }
 }
 
