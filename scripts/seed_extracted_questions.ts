@@ -107,15 +107,33 @@ async function run() {
 
     // 3. Insert questions
     console.log(`Inserting ${questions.length} questions into past_paper_questions...`);
-    const formattedQuestions = questions.map((q: any) => ({
-        past_paper_id: pastPaperId,
-        question_number: q.question_number,
-        text: q.text,
-        type: q.type,
-        options: q.options || [],
-        answer: q.answer,
-        marks: q.marks || 0
-    }));
+    const seenNumbers = new Set<string>();
+    const formattedQuestions: any[] = [];
+
+    for (const q of questions) {
+        if (!q.question_number) continue;
+        
+        let qNumStr = String(q.question_number).trim();
+        let uniqueNumber = qNumStr;
+        let counter = 1;
+        
+        while (seenNumbers.has(uniqueNumber)) {
+            uniqueNumber = `${qNumStr}_dup${counter}`;
+            counter++;
+        }
+        
+        seenNumbers.add(uniqueNumber);
+        
+        formattedQuestions.push({
+            past_paper_id: pastPaperId,
+            question_number: uniqueNumber,
+            text: q.text || '',
+            type: q.type === 'multiple_choice' ? 'multiple_choice' : 'open_ended',
+            options: q.options || [],
+            answer: q.answer || '',
+            marks: q.marks || 0
+        });
+    }
 
     const { error: insertError } = await supabase
         .from('past_paper_questions')
